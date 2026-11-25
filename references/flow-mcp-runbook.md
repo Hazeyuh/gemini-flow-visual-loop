@@ -15,6 +15,7 @@ Operational guide for running [`GTAI-1/flow-mcp`](https://github.com/GTAI-1/flow
 | `flow_assets` | In-project asset listing | Takes ~13 s (Playwright grid scroll). Useful inside small projects (`≤ 12` items) to grab `asset:<title>` handles; unnecessary when passing local `~/flow-mcp-out/...` paths. |
 | `flow_download` | Free re-download / upscale | Pulls existing Flow media without regenerating (including free 1080p/2K upscales). Always use this if a generation succeeded in Flow's UI without saving locally. |
 | `flow_retry` / `flow_cancel` | Queue recovery | `flow_retry` re-runs failed jobs under the same target filename; `flow_cancel` drops queued jobs that have not started. |
+| `flow_music_generate` | **Batch music generator (`Lyria 3.5`)** | Drives `https://www.flowmusic.app/session` Compose panel silently in a background tab (no `bringToFront()`). Supports `1–20` tracks per call (`sound`, `lyrics`, `instrumental`, `advanced`, `format: "mp3" \| "wav" \| "m4a"`), downloading to `~/flow-mcp-out/<project>/track-NN.<ext>`. Uses `flow_wait` / `flow_cancel` / `flow_retry`. |
 | `flow_agent_images` | *(Avoid for iterative loops)* | Drives Flow's batch Agent composer. Frequently stalls mid-render or times out (30 s) clicking `Reuse prompt`, losing the entire batch with 0 files saved. |
 
 ### `first_frame` vs. `reference_images`
@@ -42,6 +43,15 @@ Upstream `flow-mcp` is tuned around paid multi-shot video filmmaking. Three smal
 
 - **Root cause**: `runGeneration()` calls `await agent.getAttribute("aria-pressed")` unconditionally on `page.getByRole("button", { name: "Agent", exact: true })`. Right after `flow_new_project` opens an empty workspace where that toggle is absent, Playwright waits 30 seconds for the selector and aborts the job.
 - **Fix**: Guards the check with `if ((await agent.isVisible().catch(() => false)) && (await agent.getAttribute("aria-pressed")) === "true")`.
+
+### Patch 4: `src/music.ts`, `src/chrome.ts`, `src/queue.ts`, `src/core.ts`, `src/remote.ts`, `src/index.ts` — Google Flow Music (`Lyria 3.5`) Extension
+
+- **Purpose**: Adds `flow_music_generate` for batch music generation and automated audio download via Google Flow Music (`https://www.flowmusic.app/session`), reusing the logged-in `~/.flow-mcp/chrome-profile` CDP session.
+- **Key engineering details**:
+  - `getMusicPage()` reuses an existing `flowmusic.app` tab silently without calling `bringToFront()`, so batch runs never steal foreground focus.
+  - Drives the Compose panel (`textarea[aria-label="Sound description"]`, `textarea[aria-label="Lyrics"]`, `Toggle instrumental mode`, `Toggle advanced sound mode`, `Generate`).
+  - Downloads `MP3` / `WAV` / `M4A` by asserting CDP `Browser.setDownloadBehavior` (`~/.flow-mcp/downloads`), opening `More options` → hovering `Download` → focusing the format menuitem and sending `Enter` (reliable across Radix UI submenus even in background tabs), then moving the finished file to `~/flow-mcp-out/<project>/track-NN.<ext>`.
+  - Uses dedicated music queue pacing (`FLOW_MCP_MUSIC_PAUSE_MIN_S=5`, `MAX_S=10`). First-time use requires signing into `flowmusic.app` once inside the dedicated Flow Chrome window.
 
 ### Applying, Verifying, and Updating
 

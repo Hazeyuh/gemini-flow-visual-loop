@@ -71,3 +71,11 @@ Never approve a Round 1 image on atmosphere alone. Run every scene through four 
 4. **R4 (or R4–R5) — `Polish` (Geometry Lock & Free 2K Export)**:
    - Lock the verified R3 structure (`strictly preserving its exact locked composition... Zero new objects, zero text, zero UI`).
    - Polish micro-textures, film grain, specular roll-off, and edge mist transitions, setting `download_quality: "upscaled"` (2K, 0 credits). Verify that no new artifacts appeared before archiving final outputs and recording round-by-round decisions.
+
+## 6. `Audio-Loop`: Batch Music Generation & Listening Iteration (`Lyria 3.5`)
+
+When the patched `flow-mcp` is installed, you can also drive **Google Flow Music** (`https://www.flowmusic.app/`, `Lyria 3.5`) via `flow_music_generate`:
+
+1. **Silent background batch generation**: Pass `project` and `tracks` (`1–20` items, each with `sound`, optional `lyrics`, `instrumental`, `advanced`, and `format: "mp3" | "wav" | "m4a"`). `flow_music_generate` reuses a background `flowmusic.app` tab without stealing window focus (`bringToFront()` is never called) and saves tracks to `~/flow-mcp-out/<project>/track-NN.<ext>`.
+2. **Wait & listen silently**: Poll with `flow_wait`, then inspect each downloaded `.mp3`/`.wav` directly with `read_file` (which reads file bytes silently without playing through host speakers).
+3. **Iterate on arrangement & lyrical realism (≥ 2 rounds)**: Audit genre fidelity, intro hook, vocal tone, lyrical specificity (replacing generic AI clichés and unintended genre-trigger nouns with concrete narrative details), and dynamic climaxes, then queue refined tracks until the audio meets the brief. Never upload copyrighted reference audio to Flow Music; use text-only original style descriptions.

@@ -99,7 +99,7 @@ cd ~/flow-mcp
 npm install
 ```
 
-### 2. Apply the Three `Visual-Loop` Patches
+### 2. Apply the `Visual-Loop` & `Flow Music (Lyria 3.5)` Patches
 
 Apply [`patches/flow-mcp-visual-loop.patch`](patches/flow-mcp-visual-loop.patch) before building:
 
@@ -111,9 +111,10 @@ npm run build
 
 What the patch changes:
 
-1. **`src/queue.ts` — Fast Pacing for 0-Credit Images**: Introduces `FLOW_MCP_IMAGE_PAUSE_MIN_S` (default `2`) and `FLOW_MCP_IMAGE_PAUSE_MAX_S` (default `4`) for `job.params.type === "image"`, saving ~45 s of dead pause per image while keeping the 25–70 s anti-bot pause on paid video generations.
-2. **`src/core.ts` — Scoped `CHARACTER LOCK` Filter**: Excludes scene outputs matching `/(-scene-\d+|^fm-)/i` from triggering the automatic `CHARACTER LOCK` facial/wardrobe freeze when referenced via `asset:<title>`, allowing R2/R3 structural edits to reshape scenes freely while keeping `CHARACTER LOCK` intact for named characters.
+1. **`src/queue.ts` — Separate Pacing for 0-Credit Images & Flow Music**: Introduces `FLOW_MCP_IMAGE_PAUSE_MIN_S` / `MAX_S` (default `2–4 s`) for `type === "image"` and `FLOW_MCP_MUSIC_PAUSE_MIN_S` / `MAX_S` (default `5–10 s`) for `type === "music"`, while keeping the `25–70 s` anti-bot pause on paid video generations.
+2. **`src/core.ts` — Scoped `CHARACTER LOCK` Filter & `music_generate` Queue**: Excludes scene outputs matching `/(-scene-\d+|^fm-)/i` from triggering `CHARACTER LOCK` when referenced via `asset:<title>`, and adds `music_generate` (`tracks` batch of 1–20 songs) to `Core` / `LocalCore` / `RemoteCore`.
 3. **`src/flow.ts` — Blank-Project `Agent` Toggle Guard**: Checks `await agent.isVisible()` before reading `aria-pressed` on Flow's `Agent` mode button, preventing 30-second timeouts right after `flow_new_project`.
+4. **`src/chrome.ts`, `src/music.ts`, `src/index.ts`, `src/remote.ts` — Google Flow Music (`Lyria 3.5`) Extension (`flow_music_generate`)**: Adds a `flow_music_generate` MCP tool that silently reuses a background `https://www.flowmusic.app/session` tab (never calling `bringToFront()`), fills the Compose panel (`Sound description`, `Lyrics`, `Instrumental` / `Advanced` switches), waits for completion, and downloads `MP3` / `WAV` / `M4A` via Radix UI keyboard navigation + CDP `Browser.setDownloadBehavior` into `~/flow-mcp-out/<project>/track-NN.<ext>`. Combined with native multimodal audio reading (`read_file`), an agent can run multi-round **Audio-Loop** iterations (generate → listen silently on disk → critique genre drift, arrangement, and lyrical realism → rewrite & regenerate).
 
 ### 3. Sign In & Register MCP
 
@@ -168,7 +169,7 @@ git clone https://github.com/Hazeyuh/gemini-flow-visual-loop ~/.agents/skills/ge
 | --- | --- |
 | [`README.md`](README.md) | Human-facing overview, latency benchmarks, 4-stage `Visual-Loop` methodology, pitfalls, and setup |
 | [`SKILL.md`](SKILL.md) | Progressive-disclosure Agent Skill instructions for Antigravity, Codex, and Claude Code |
-| [`patches/flow-mcp-visual-loop.patch`](patches/flow-mcp-visual-loop.patch) | Unified diff against `GTAI-1/flow-mcp` (`src/core.ts`, `src/flow.ts`, `src/queue.ts`) |
+| [`patches/flow-mcp-visual-loop.patch`](patches/flow-mcp-visual-loop.patch) | Unified diff against `GTAI-1/flow-mcp` (`src/chrome.ts`, `src/core.ts`, `src/flow.ts`, `src/index.ts`, `src/music.ts`, `src/queue.ts`, `src/remote.ts`) |
 | [`references/prompt-templates-and-cases.md`](references/prompt-templates-and-cases.md) | 500+ word `Pure-Lens`, `Ref-Forge`, `Sculpt`/`Forensic`, and 2K `Polish` prompt templates + R1–R4 case studies |
 | [`references/flow-mcp-runbook.md`](references/flow-mcp-runbook.md) | Tool selection matrix, `RemoteCore` recovery, project rotation rules, and credit guardrails |
 | [`agents/openai.yaml`](agents/openai.yaml) | Implicit skill invocation policy metadata |

@@ -1,8 +1,93 @@
+diff --git a/src/chrome.ts b/src/chrome.ts
+index ea7208f..00e7e0b 100644
+--- a/src/chrome.ts
++++ b/src/chrome.ts
+@@ -5,6 +5,7 @@ import { join } from "node:path";
+ import { chromium, type Browser, type Page } from "playwright-core";
+ 
+ export const FLOW_URL = "https://flow.google.com/";
++export const MUSIC_URL = "https://www.flowmusic.app/session";
+ // Flow's buttons are found by their English names ("Start generation", "Download"...), so Flow has to show in English
+ // whatever language the Google account uses. `hl=en` on the address does that: `hl=es` turned every label Spanish on
+ // an English account (2026-10-13), the choice holds through Flow's in-app navigation, and the browser's own language
+@@ -15,6 +16,7 @@ export const inEnglish = (url: string): string => {
+   return u.toString();
+ };
+ const FLOW_HOSTS = /^https:\/\/(flow\.google\.com|labs\.google\/fx)/;
++const MUSIC_HOSTS = /^https:\/\/(www\.)?flowmusic\.app/;
+ export const HOME_DIR = process.env.FLOW_MCP_HOME ?? join(homedir(), ".flow-mcp");
+ export const PROFILE_DIR = join(HOME_DIR, "chrome-profile");
+ export const CDP_PORT = Number(process.env.FLOW_MCP_CDP_PORT ?? 9333);
+@@ -93,6 +95,18 @@ export async function getFlowPage(): Promise<Page> {
+   return page;
+ }
+ 
++// Reuses the Flow Music tab silently in the background (never calls bringToFront).
++export async function getMusicPage(): Promise<Page> {
++  const b = await getBrowser();
++  const context = b.contexts()[0];
++  if (!context) throw new Error("Chrome has no browser context; restart the Flow Chrome window.");
++  const existing = context.pages().find((p) => MUSIC_HOSTS.test(p.url()));
++  if (existing) return existing;
++  const page = await context.newPage();
++  await page.goto(MUSIC_URL, { waitUntil: "domcontentloaded" });
++  return page;
++}
++
+ // Reloads Flow in English when it is showing in another language (a page the user opened by hand, or Flow redirecting
+ // to an address without hl). Sign-in pages are left alone.
+ export async function ensureEnglish(page: Page): Promise<void> {
 diff --git a/src/core.ts b/src/core.ts
-index dd4afbc..8f89079 100644
+index dd4afbc..5427571 100644
 --- a/src/core.ts
 +++ b/src/core.ts
-@@ -539,7 +539,7 @@ export class LocalCore implements Core {
+@@ -9,6 +9,7 @@ import { extractFirstFrame, extractFrameAt, extractLastFrame } from "./chain.js"
+ import { burnCaptions, captionedName, captionSetup, previewCaptions, transcribe } from "./captions.js";
+ import { presenter } from "./presenter.js";
+ import { characterLook, createCharacter, createProject, downloadAsset, downloadCollection, trashAsset, editCharacter, getFlowState, listAssets, forgetCharacter, listCharacters, rememberCharacter, runAgentBatch, runContinue, runEdit, runGeneration } from "./flow.js";
++import { runMusicGeneration } from "./music.js";
+ import { JobQueue, type Job } from "./queue.js";
+ import { BIN, COMPUTER, moveToBin } from "./platform.js";
+ import { TECHNIQUES, techniqueById } from "./techniques.js";
+@@ -412,6 +413,21 @@ export const shapes = {
+     voice: z.string().optional().describe("Flow voice name, e.g. 'Charon' (male, informative) or 'Aoede' (female, breezy)."),
+   },
+   techniques: { category: z.enum(["camera", "product", "transition", "image"]).optional() },
++  music_generate: {
++    project: z.string().min(1).describe("Folder name for the downloaded music tracks, e.g. 'IndieRockBatch'."),
++    tracks: z
++      .array(
++        z.object({
++          sound: z.string().min(1).describe("Detailed English sound/style description for Lyria 3.5: genre, tempo/BPM, key, instruments, vocal style, arrangement, production mix."),
++          lyrics: z.string().optional().describe("Optional song lyrics with structure tags ([Verse 1], [Chorus], [Bridge]). Ignored when instrumental is true."),
++          instrumental: z.boolean().default(false).describe("True for instrumental-only tracks (no vocals)."),
++          advanced: z.boolean().optional().describe("Optional toggle for Flow Music's Advanced sound mode."),
++          format: z.enum(["mp3", "wav", "m4a"]).default("mp3").describe("Audio download format. Default 'mp3' (compact, ready for agent listening); 'wav' for lossless master."),
++        }),
++      )
++      .min(1)
++      .max(20),
++  },
+ };
+ 
+ type Args<K extends keyof typeof shapes> = z.infer<z.ZodObject<(typeof shapes)[K]>>;
+@@ -435,6 +451,7 @@ export const jobView = ({ id, status, params, files, attempts, credits, progress
+ export interface Core {
+   status(a: Args<"status">): Promise<unknown>;
+   generate(a: Args<"generate">): Promise<unknown>;
++  music_generate(a: Args<"music_generate">): Promise<unknown>;
+   wait(a: Args<"wait">): Promise<unknown>;
+   cancel(a: Args<"cancel">): Promise<unknown>;
+   retry(a: Args<"retry">): Promise<unknown>;
+@@ -485,6 +502,7 @@ const BUSY = "A generation is running in the Flow tab. Wait for it to finish (fl
+ 
+ export class LocalCore implements Core {
+   private queue: JobQueue = new JobQueue(async (job) => {
++    if (job.params.type === "music") return runMusicGeneration(job);
+     const { chain_from, reference_from } = job.params;
+     if (reference_from) {
+       const still = this.queue.get(reference_from)?.files.find((f) => /\.(jpe?g|png|webp)$/i.test(f));
+@@ -539,7 +557,7 @@ export class LocalCore implements Core {
        const cast = (scene.reference_images ?? [])
          .filter((r) => r.startsWith("asset:"))
          .map((r) => r.slice(6).trim())
@@ -11,6 +96,40 @@ index dd4afbc..8f89079 100644
        // With an outfit the lock still pins face, hair and build, but the clothes come from the scene: otherwise the
        // saved look (Skye's denim shirt) fights a costume the prompt asks for.
        const lock = cast.length
+@@ -572,6 +590,33 @@ export class LocalCore implements Core {
+     return { output_dir, jobs: jobs.map(jobView) };
+   }
+ 
++  async music_generate({ project, tracks }: Args<"music_generate">) {
++    const output_dir = projectDir(project);
++    const onDisk = existsSync(output_dir) ? readdirSync(output_dir).map((f) => Number(f.match(/^track-(\d+)/)?.[1] ?? 0)) : [];
++    const queued = this.queue
++      .list()
++      .filter((j) => j.params.output_dir === output_dir && j.params.file_stem.startsWith("track-"))
++      .map((j) => Number(j.params.file_stem.match(/\d+/)?.[0] ?? 0));
++    const offset = Math.max(0, ...onDisk, ...queued);
++    const jobs: Job[] = [];
++    for (const [i, track] of tracks.entries()) {
++      jobs.push(
++        this.queue.add({
++          prompt: track.sound.trim(),
++          type: "music",
++          max_credits: 0,
++          music_lyrics: track.lyrics,
++          music_instrumental: track.instrumental,
++          music_advanced: track.advanced,
++          music_format: track.format,
++          output_dir,
++          file_stem: `track-${String(offset + i + 1).padStart(2, "0")}`,
++        }),
++      );
++    }
++    return { output_dir, jobs: jobs.map(jobView) };
++  }
++
+   async wait({ job_ids, timeout_seconds }: Args<"wait">) {
+     const pick = () => (job_ids ? job_ids.map((id) => this.queue.get(id)).filter((j): j is Job => Boolean(j)) : this.queue.list());
+     const deadline = Date.now() + timeout_seconds * 1000;
 diff --git a/src/flow.ts b/src/flow.ts
 index 75d75e0..a8ac860 100644
 --- a/src/flow.ts
@@ -24,11 +143,259 @@ index 75d75e0..a8ac860 100644
    const clear = page.getByRole("button", { name: "Clear prompt" });
    if (await clear.isVisible().catch(() => false)) await clear.click();
  
+diff --git a/src/index.ts b/src/index.ts
+index 6671e94..b7d99cf 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -108,6 +108,18 @@ server.registerTool(
+   (args) => reply(core.generate(args)),
+ );
+ 
++server.registerTool(
++  "flow_music_generate",
++  {
++    title: "Queue Google Flow Music (Lyria 3.5) tracks",
++    description:
++      "Queue one or more songs in Google Flow Music (https://www.flowmusic.app/, Lyria 3.5) using the Compose panel silently in the background tab, then download each finished track as MP3, WAV or M4A into ~/flow-mcp-out/<project>/. Supports batch generation (up to 20 tracks per call), custom lyrics or instrumental mode. Returns job ids immediately; use flow_wait for results.",
++    inputSchema: shapes.music_generate,
++    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
++  },
++  (args) => reply(core.music_generate(args)),
++);
++
+ server.registerTool(
+   "flow_wait",
+   {
+diff --git a/src/music.ts b/src/music.ts
+new file mode 100644
+index 0000000..7030a78
+--- /dev/null
++++ b/src/music.ts
+@@ -0,0 +1,205 @@
++import { copyFileSync, existsSync, mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
++import { homedir } from "node:os";
++import { join } from "node:path";
++import type { Locator, Page } from "playwright-core";
++import { HOME_DIR, MUSIC_URL, getMusicPage } from "./chrome.js";
++import type { Job } from "./queue.js";
++
++const DOWNLOAD_DIR = join(HOME_DIR, "downloads");
++const SYSTEM_DOWNLOADS = join(homedir(), "Downloads");
++const MUSIC_TIMEOUT_MS = 4 * 60_000;
++const DOWNLOAD_TIMEOUT_MS = 45_000;
++
++const pause = (page: Page, ms: number) => page.waitForTimeout(ms);
++
++async function useOwnDownloadDir(page: Page): Promise<void> {
++  mkdirSync(DOWNLOAD_DIR, { recursive: true });
++  const cdp = await page.context().newCDPSession(page);
++  await cdp.send("Browser.setDownloadBehavior", {
++    behavior: "allowAndName",
++    downloadPath: DOWNLOAD_DIR,
++    eventsEnabled: true,
++  });
++}
++
++function downloadsNow(): Set<string> {
++  const seen = new Set<string>();
++  for (const dir of [DOWNLOAD_DIR, SYSTEM_DOWNLOADS]) {
++    if (existsSync(dir)) for (const f of readdirSync(dir)) seen.add(`${dir}/${f}`);
++  }
++  return seen;
++}
++
++async function waitForDownloadedFile(page: Page, before: Set<string>, timeoutMs: number): Promise<string> {
++  const deadline = Date.now() + timeoutMs;
++  let stable: { path: string; size: number } | undefined;
++  while (Date.now() < deadline) {
++    await pause(page, 300);
++    for (const dir of [DOWNLOAD_DIR, SYSTEM_DOWNLOADS]) {
++      if (!existsSync(dir)) continue;
++      for (const f of readdirSync(dir)) {
++        const full = join(dir, f);
++        if (before.has(`${dir}/${f}`) || f.endsWith(".crdownload") || f.startsWith(".")) continue;
++        const size = statSync(full).size;
++        if (stable?.path === full && stable.size === size && size > 0) return full;
++        stable = { path: full, size };
++      }
++    }
++  }
++  throw new Error("Flow Music started the download but no audio file arrived in ~/.flow-mcp/downloads or ~/Downloads.");
++}
++
++async function setSwitch(sw: Locator, want: boolean): Promise<void> {
++  await sw.waitFor({ state: "visible", timeout: 10_000 });
++  const checked = (await sw.getAttribute("aria-checked")) === "true" || (await sw.getAttribute("data-state")) === "checked";
++  if (checked !== want) await sw.click();
++}
++
++async function ensureSignedIn(page: Page): Promise<void> {
++  const url = page.url();
++  if (/accounts\.google\.com/.test(url)) {
++    throw new Error("Google Flow Music is not signed in. Sign in to https://www.flowmusic.app/ in the Flow Chrome window, then retry.");
++  }
++  const loginBtn = page.getByRole("button", { name: /^(Log in|Sign up|登录|免费注册)$/i }).first();
++  if (await loginBtn.isVisible().catch(() => false)) {
++    throw new Error("Google Flow Music is not signed in. Click Log in on https://www.flowmusic.app/ in the Flow Chrome window, then retry.");
++  }
++}
++
++async function downloadFromMoreButton(
++  page: Page,
++  moreBtn: Locator,
++  format: "mp3" | "wav" | "m4a",
++  destPath: string,
++): Promise<string> {
++  await useOwnDownloadDir(page);
++  const before = downloadsNow();
++
++  await page.keyboard.press("Escape");
++  await pause(page, 200);
++  await moreBtn.click({ timeout: 10_000 });
++  await pause(page, 500);
++
++  const dlMenu = page.getByRole("menuitem", { name: /^Download$/i }).first();
++  await dlMenu.waitFor({ state: "visible", timeout: 8_000 });
++  await dlMenu.hover();
++  await pause(page, 500);
++
++  const fmtLabel = format.toUpperCase();
++  const fmtItem = page.getByRole("menuitem", { name: new RegExp(`^${fmtLabel}$`, "i") }).first();
++  await fmtItem.waitFor({ state: "visible", timeout: 8_000 });
++  // Radix UI submenus reliably trigger on keyboard Enter even when Chrome is in the background.
++  await fmtItem.focus();
++  await page.keyboard.press("Enter");
++
++  const downloaded = await waitForDownloadedFile(page, before, DOWNLOAD_TIMEOUT_MS);
++  copyFileSync(downloaded, destPath);
++  rmSync(downloaded, { force: true });
++  return destPath;
++}
++
++export async function runMusicGeneration(job: Job): Promise<string[]> {
++  const page = await getMusicPage();
++  const format = job.params.music_format ?? "mp3";
++  const instrumental = Boolean(job.params.music_instrumental);
++
++  job.progress = "Opening Flow Music session";
++  await page.goto(MUSIC_URL, { waitUntil: "domcontentloaded", timeout: 30_000 });
++  await pause(page, 1800);
++  await ensureSignedIn(page);
++
++  // Open Compose panel if not already expanded
++  const soundBox = page.locator('textarea[aria-label="Sound description"]');
++  if (!(await soundBox.isVisible().catch(() => false))) {
++    const toggle = page.getByRole("button", { name: /Toggle compose panel|Open compose panel/i }).first();
++    await toggle.waitFor({ state: "visible", timeout: 15_000 });
++    await toggle.click();
++    await soundBox.waitFor({ state: "visible", timeout: 10_000 });
++  }
++
++  // Configure switches and text inputs
++  await setSwitch(page.locator('button[aria-label="Toggle instrumental mode"]'), instrumental);
++  await pause(page, 300);
++
++  if (job.params.music_advanced !== undefined) {
++    const advSwitch = page.locator('button[aria-label="Toggle advanced sound mode"]');
++    if (await advSwitch.isVisible().catch(() => false)) {
++      await setSwitch(advSwitch, job.params.music_advanced);
++      await pause(page, 300);
++    }
++  }
++
++  if (!instrumental) {
++    const lyricsBox = page.locator('textarea[aria-label="Lyrics"]');
++    if (await lyricsBox.isVisible().catch(() => false)) {
++      await lyricsBox.fill(job.params.music_lyrics ?? "");
++    }
++  }
++
++  await soundBox.fill(job.params.prompt);
++  await pause(page, 400);
++
++  const genBtn = page.getByRole("button", { name: /^Generate$/i }).first();
++  await genBtn.waitFor({ state: "visible", timeout: 10_000 });
++  if (await genBtn.isDisabled()) {
++    throw new Error("Flow Music Generate button is disabled; check prompt length or account quota.");
++  }
++
++  job.progress = "Generating track in Flow Music (Lyria 3.5)";
++  await genBtn.click();
++
++  // Wait for generated song card(s) to appear and finish generating
++  const deadline = Date.now() + MUSIC_TIMEOUT_MS;
++  let uniqueSongIds: string[] = [];
++  while (Date.now() < deadline) {
++    await pause(page, 3000);
++    const snap = await page.evaluate(() => {
++      const clean = (s: string | null | undefined) => (s || "").replace(/\s+/g, " ").trim();
++      const ids = new Set<string>();
++      for (const a of document.querySelectorAll('a[href^="/song/"]')) {
++        const m = (a.getAttribute("href") || "").match(/^\/song\/([0-9a-f-]+)/i);
++        if (m) ids.add(m[1]);
++      }
++      const moreCount = document.querySelectorAll('button[aria-label^="More options for"]').length;
++      const body = clean(document.body?.innerText);
++      const generating = /\b(generating|creating|composing)\b/i.test(body);
++      const errMatch = body.match(/(out of credits|quota exceeded|rate limit|something went wrong|failed to generate[^.!\n]*)/i);
++      return { ids: [...ids], moreCount, generating, error: errMatch?.[0] ?? null };
++    });
++    if (snap.error) throw new Error(`Flow Music reported an error: ${snap.error}`);
++    if (snap.ids.length > 0 && snap.moreCount > 0 && !snap.generating) {
++      uniqueSongIds = snap.ids;
++      break;
++    }
++  }
++
++  if (!uniqueSongIds.length) {
++    throw new Error("Timed out waiting for Flow Music to finish generating the track.");
++  }
++
++  // Let the finished song settle before triggering download
++  await pause(page, 2000);
++  mkdirSync(job.params.output_dir, { recursive: true });
++
++  const saved: string[] = [];
++  for (let i = 0; i < uniqueSongIds.length; i++) {
++    const songId = uniqueSongIds[i];
++    const suffix = uniqueSongIds.length > 1 ? `-v${i + 1}` : "";
++    const dest = join(job.params.output_dir, `${job.params.file_stem}${suffix}.${format}`);
++    job.progress = `Downloading track ${i + 1}/${uniqueSongIds.length} (${format.toUpperCase()})`;
++
++    // Match the More options button inside the card carrying this songId, falling back to nth/first.
++    const cardMore = page
++      .locator(`:has(> a[href="/song/${songId}"]), :has(a[href="/song/${songId}"])`)
++      .locator('button[aria-label^="More options for"]')
++      .first();
++    const targetBtn = (await cardMore.isVisible().catch(() => false))
++      ? cardMore
++      : page.locator('button[aria-label^="More options for"]').nth(i);
++
++    saved.push(await downloadFromMoreButton(page, targetBtn, format, dest));
++  }
++
++  job.note = `Lyria 3.5 (${format.toUpperCase()}), song_ids: ${uniqueSongIds.join(", ")}`;
++  return saved;
++}
 diff --git a/src/queue.ts b/src/queue.ts
-index c8e1b6b..5967643 100644
+index c8e1b6b..9920356 100644
 --- a/src/queue.ts
 +++ b/src/queue.ts
-@@ -56,9 +56,11 @@ export interface Job {
+@@ -4,8 +4,12 @@ export type JobStatus = "queued" | "running" | "done" | "failed" | "cancelled";
+ 
+ export interface SceneParams {
+   prompt: string;
+-  type: "video" | "image";
++  type: "video" | "image" | "music";
+   max_credits: number;
++  music_lyrics?: string;
++  music_instrumental?: boolean;
++  music_advanced?: boolean;
++  music_format?: "mp3" | "wav" | "m4a";
+   duration?: 4 | 6 | 8 | 10;
+   resolution?: "360p" | "720p";
+   model?: string;
+@@ -56,9 +60,13 @@ export interface Job {
  export type JobRunner = (job: Job) => Promise<string[]>;
  
  // Flow is driven like a careful person would: one generation at a time, with a
@@ -38,17 +405,31 @@ index c8e1b6b..5967643 100644
  const PAUSE_MAX_MS = Number(process.env.FLOW_MCP_PAUSE_MAX_S ?? 70) * 1000;
 +const IMAGE_PAUSE_MIN_MS = Number(process.env.FLOW_MCP_IMAGE_PAUSE_MIN_S ?? 2) * 1000;
 +const IMAGE_PAUSE_MAX_MS = Number(process.env.FLOW_MCP_IMAGE_PAUSE_MAX_S ?? 4) * 1000;
++const MUSIC_PAUSE_MIN_MS = Number(process.env.FLOW_MCP_MUSIC_PAUSE_MIN_S ?? 5) * 1000;
++const MUSIC_PAUSE_MAX_MS = Number(process.env.FLOW_MCP_MUSIC_PAUSE_MAX_S ?? 10) * 1000;
  
  export class JobQueue {
    private jobs = new Map<string, Job>();
-@@ -123,7 +125,9 @@ export class JobQueue {
+@@ -123,7 +131,9 @@ export class JobQueue {
          const job = this.list().find((j) => j.status === "queued");
          if (!job) return;
          if (this.lastFinished) {
 -          const pause = PAUSE_MIN_MS + Math.random() * (PAUSE_MAX_MS - PAUSE_MIN_MS);
-+          const minMs = job.params.type === "image" ? IMAGE_PAUSE_MIN_MS : PAUSE_MIN_MS;
-+          const maxMs = job.params.type === "image" ? IMAGE_PAUSE_MAX_MS : PAUSE_MAX_MS;
++          const minMs = job.params.type === "image" ? IMAGE_PAUSE_MIN_MS : job.params.type === "music" ? MUSIC_PAUSE_MIN_MS : PAUSE_MIN_MS;
++          const maxMs = job.params.type === "image" ? IMAGE_PAUSE_MAX_MS : job.params.type === "music" ? MUSIC_PAUSE_MAX_MS : PAUSE_MAX_MS;
 +          const pause = minMs + Math.random() * Math.max(0, maxMs - minMs);
            const remaining = this.lastFinished + pause - Date.now();
            if (remaining > 0) {
              this.pausedReason = `pacing: next generation in ${Math.ceil(remaining / 1000)}s`;
+diff --git a/src/remote.ts b/src/remote.ts
+index cb3bd1f..489a927 100644
+--- a/src/remote.ts
++++ b/src/remote.ts
+@@ -17,6 +17,7 @@ async function call(method: string, args: unknown): Promise<unknown> {
+ export class RemoteCore implements Core {
+   status = (a: unknown) => call("status", a);
+   generate = (a: unknown) => call("generate", a);
++  music_generate = (a: unknown) => call("music_generate", a);
+   cancel = (a: unknown) => call("cancel", a);
+   retry = (a: unknown) => call("retry", a);
+   assets = (a: unknown) => call("assets", a);
